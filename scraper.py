@@ -116,43 +116,43 @@ class DatabaseManager:
             pass
 
     def _init_schema(self) -> None:
-    """
-    Drop and recreate auction_items to guarantee correct schema.
-    WARNING: This will delete any existing data in auction_items.
-    """
-    with self.conn.cursor() as cur:
-        # Drop first
-        cur.execute("DROP TABLE IF EXISTS auction_items;")
-        self.conn.commit()
-        
-        # Create table
-        create_table = """
-        CREATE TABLE auction_items (
-            id BIGSERIAL PRIMARY KEY,
-            location_id INTEGER NOT NULL,
-            location_name VARCHAR(50) NOT NULL,
-            item_id VARCHAR(120) NOT NULL,
-            title TEXT,
-            retail_price NUMERIC(12,2),
-            current_price NUMERIC(12,2),
-            url TEXT,
-            image_url TEXT,
-            scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(location_id, item_id)
-        );
         """
-        cur.execute(create_table)
-        self.conn.commit()
-        
-        # Create index
-        index_sql = """
-        CREATE INDEX idx_auction_items_location_scraped
-            ON auction_items (location_id, scraped_at DESC);
+        Drop and recreate auction_items to guarantee correct schema.
+        WARNING: This will delete any existing data in auction_items.
         """
-        cur.execute(index_sql)
-        self.conn.commit()
-    
-    log("DB schema dropped & recreated (auction_items)", "SUCCESS")
+        with self.conn.cursor() as cur:
+            # 1) Drop table if exists
+            cur.execute("DROP TABLE IF EXISTS auction_items;")
+            self.conn.commit()
+
+            # 2) Create table fresh
+            create_table = """
+            CREATE TABLE auction_items (
+                id BIGSERIAL PRIMARY KEY,
+                location_id INTEGER NOT NULL,
+                location_name VARCHAR(50) NOT NULL,
+                item_id VARCHAR(120) NOT NULL,
+                title TEXT,
+                retail_price NUMERIC(12,2),
+                current_price NUMERIC(12,2),
+                url TEXT,
+                image_url TEXT,
+                scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(location_id, item_id)
+            );
+            """
+            cur.execute(create_table)
+            self.conn.commit()
+
+            # 3) Create index
+            index_sql = """
+            CREATE INDEX IF NOT EXISTS idx_auction_items_location_scraped
+                ON auction_items (location_id, scraped_at DESC);
+            """
+            cur.execute(index_sql)
+            self.conn.commit()
+
+        log("DB schema dropped & recreated (auction_items)", "SUCCESS")
 
     def upsert_items(self, items: List[AuctionItem]) -> None:
         if not items:
