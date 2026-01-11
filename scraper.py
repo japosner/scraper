@@ -1,321 +1,407 @@
 import asyncio
+import os
+import random
 import re
-from datetime import datetime, timezone
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, unquote
+
+import psycopg
+from psycopg.rows import dict_row
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
 from bs4 import BeautifulSoup
+
 from crawl4ai import AsyncWebCrawler
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
-from concurrent.futures import ThreadPoolExecutor
-import time
-import random
-from typing import Optional, Dict, List, Set
-import os
-import json
-from urllib.parse import urljoin, parse_qs
 
 
-# Database Config - Cloud-ready with env vars
-DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME", "Nellis"),
-    "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "Sophie0505!105"),
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432"),
-}
+# ---------------------------
+# Static config
+# ---------------------------
 
-
-LOCATION_MAP = {
-    "delran_philly": 6,  # Use Delran's cookie for both zones
+LOCATION_MAP: Dict[str, int] = {
+    "delran_philly": 6,
     "dallas": 5,
     "las_vegas": 1,
     "salt_lake": 7,
 }
 
+BASE_SEARCH_URL = (
+    "https://www.nellisauction.com/search"
+    "?query=&sortBy=retail_price_desc"
+    "&page={page}"
+)
 
-BASE_SEARCH_URL = "https://www.nellisauction.com/search?query=&sortBy=retail_price_desc&page={page}"
-
-
-# Configuration
 CONFIG = {
-    "max_retries": 3,
-    "retry_delay": 3,
-    "request_delay": (2, 5),
-    "batch_size": 25,
-    "max_workers": 5,
     "timeout": 30,
-    "page_delay": (5, 15),
-    "max_items_per_location": 500,
+    "request_delay": (1.5, 3.5),
+    "page_delay": (6, 12),
+    "max_pages_per_location": 40,
+    "max_items_per_location": 400,
+    "min_items_per_page_stop": 3,
+    "max_retries": 3,
 }
 
+SHOPPING_LOCATION_ENDPOINT = "https://www.nellisauction.com/api/shopping-location/set"
+SHOPPING_LOCATION_COOKIE_NAME = "__shopping-location"
 
-# ---- NO PROXIES: all requests go direct ----
+
+# ---------------------------
+# Logging
+# ---------------------------
+
+def log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
 
 
-# ---- Database Manager ----
+# ---------------------------
+# DB config helpers
+# ---------------------------
+
+def _db_config_from_env() -> Dict[str, str]:
+    """
+    Supports either:
+      - DATABASE_URL (preferred, from Render Postgres)
+      - DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        u = urlparse(database_url)
+        return {
+            "host": u.hostname or "",
+            "port": str(u.port or 5432),
+            "dbname": (u.path or "").lstrip("/"),
+            "user": unquote(u.username or ""),
+            "password": unquote(u.password or ""),
+            "sslmode": os.getenv("DB_SSLMODE", "require"),
+        }
+
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": os.getenv("DB_PORT", "5432"),
+        "dbname": os.getenv("DB_NAME", "Nellis"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+
+
+@dataclass
+class AuctionItem:
+    location_id: int
+    location_name: str
+    item_id: str
+    title: str
+    retail_price: Optional[float]
+    current_price: Optional[float]
+    url: str
+    image_url: Optional[str]
+
+
 class DatabaseManager:
-    def __init__(self):
-        self.conn = None
-        self.cursor = None
-        self.connect()
-        self.init_tables()
-    
-    def connect(self):
+    def __init__(self) -> None:
+        self.db_cfg = _db_config_from_env()
+        self.conn = psycopg.connect(**self.db_cfg, row_factory=dict_row)
+        self.conn.autocommit = False
+        log(f"Connected DB host={self.db_cfg.get('host')} db={self.db_cfg.get('dbname')}", "SUCCESS")
+        self._init_schema()
+
+    def close(self) -> None:
         try:
-            self.conn = psycopg2.connect(**DB_CONFIG)
-            self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
-            self.conn.autocommit = False
-        except Exception as e:
-            log(f"Database connection failed: {e}", "ERROR")
-            raise
-    
-    def close(self):
-        if self.cursor:
-            self.cursor.close()
-        if self.conn:
             self.conn.close()
-    
-    def init_tables(self):
-        """Create tables if not exist"""
-        create_items = """
-        CREATE TABLE IF NOT EXISTS auction_items (
-            id SERIAL PRIMARY KEY,
-            location_id INT,
-            location_name VARCHAR(50),
-            item_id VARCHAR(50),
+        except Exception:
+            pass
+
+    def _init_schema(self) -> None:
+        """
+        Drop and recreate auction_items to guarantee correct schema.
+        WARNING: This will delete any existing data in auction_items.
+        """
+        ddl = """
+        DROP TABLE IF EXISTS auction_items;
+
+        CREATE TABLE auction_items (
+            id BIGSERIAL PRIMARY KEY,
+            location_id INTEGER NOT NULL,
+            location_name VARCHAR(50) NOT NULL,
+            item_id VARCHAR(120) NOT NULL,
             title TEXT,
-            retail_price DECIMAL(10,2),
-            current_price DECIMAL(10,2),
+            retail_price NUMERIC(12,2),
+            current_price NUMERIC(12,2),
             url TEXT,
             image_url TEXT,
-            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(location_id, item_id)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_auction_items_location_scraped
+            ON auction_items (location_id, scraped_at DESC);
         """
-        try:
-            self.cursor.execute(create_items)
-            self.conn.commit()
-            log("Tables ready", "SUCCESS")
-        except Exception as e:
-            self.conn.rollback()
-            log(f"Table init failed: {e}", "ERROR")
-    
-    def insert_items_batch(self, items: List[Dict]):
-        """Batch insert with conflict handling"""
+        with self.conn.cursor() as cur:
+            cur.execute(ddl)
+        self.conn.commit()
+        log("DB schema dropped & recreated (auction_items)", "SUCCESS")
+
+    def upsert_items(self, items: List[AuctionItem]) -> None:
         if not items:
             return
-        
-        insert_query = """
-        INSERT INTO auction_items 
-        (location_id, location_name, item_id, title, retail_price, current_price, url, image_url)
-        VALUES (%(location_id)s, %(location_name)s, %(item_id)s, %(title)s, %(retail_price)s, 
-                %(current_price)s, %(url)s, %(image_url)s)
-        ON CONFLICT (location_id, item_id) DO UPDATE SET
+
+        sql = """
+        INSERT INTO auction_items
+            (location_id, location_name, item_id, title, retail_price, current_price, url, image_url)
+        VALUES
+            (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (location_id, item_id)
+        DO UPDATE SET
             title = EXCLUDED.title,
             retail_price = EXCLUDED.retail_price,
             current_price = EXCLUDED.current_price,
             url = EXCLUDED.url,
             image_url = EXCLUDED.image_url,
-            scraped_at = CURRENT_TIMESTAMP
+            scraped_at = CURRENT_TIMESTAMP;
         """
-        try:
-            execute_values(self.cursor, insert_query, items)
-            self.conn.commit()
-            log(f"Inserted/updated {len(items)} items", "SUCCESS")
-        except Exception as e:
-            self.conn.rollback()
-            log(f"Batch insert failed: {e}", "ERROR")
+
+        rows: List[Tuple] = [
+            (
+                it.location_id,
+                it.location_name,
+                it.item_id,
+                it.title,
+                it.retail_price,
+                it.current_price,
+                it.url,
+                it.image_url,
+            )
+            for it in items
+        ]
+
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        self.conn.commit()
+        log(f"Upserted {len(items)} items", "SUCCESS")
 
 
-# Global database manager
-db = None
-
-
-def refresh_db():
-    global db
-    try:
-        if db:
-            db.close()
-    except Exception:
-        pass
-    db = DatabaseManager()
-
-
-# Logging - FIXED: No emojis to avoid encoding issues
-def log(msg: str, level: str = "INFO"):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    levels = {
-        "INFO": "[INFO]", 
-        "SUCCESS": "[SUCCESS]", 
-        "WARNING": "[WARNING]", 
-        "ERROR": "[ERROR]"
-    }
-    icon = levels.get(level, "[INFO]")
-    print(f"[{timestamp}] {icon} {msg}")
-
+# ---------------------------
+# Location cookie
+# ---------------------------
 
 def fetch_location_cookie(location_id: int, location_name: str) -> Optional[str]:
-    """POST to set shopping location and return __shopping-location cookie."""
-    payloads = [
+    """
+    Calls the location endpoint and returns the __shopping-location cookie.
+    """
+    session = requests.Session()
+    session.headers.update(
         {
-            "shoppingLocationId": str(location_id),
-            "referrer": "/search?sortBy=retail_price_desc&query="
-        },
-        {
-            "shoppingLocationId": location_id
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/html,*/*",
+            "Content-Type": "application/json",
+            "Referer": "https://www.nellisauction.com/",
+            "Origin": "https://www.nellisauction.com",
         }
+    )
+
+    payloads = [
+        {"shoppingLocationId": str(location_id), "referrer": "/search?sortBy=retail_price_desc&query="},
+        {"shoppingLocationId": location_id},
     ]
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Content-Type': 'application/json',
-        'Referer': 'https://www.nellisauction.com/',
-        'Origin': 'https://www.nellisauction.com'
-    }
-    
+
     for payload in payloads:
-        for attempt in range(CONFIG["max_retries"]):
+        for attempt in range(1, CONFIG["max_retries"] + 1):
             try:
-                response = requests.post(
-                    'https://www.nellisauction.com/api/shopping-location/set',  # FIXED: Verify this endpoint
+                r = session.post(
+                    SHOPPING_LOCATION_ENDPOINT,
                     json=payload,
-                    headers=headers,
-                    timeout=CONFIG["timeout"]
+                    timeout=CONFIG["timeout"],
                 )
-                response.raise_for_status()
-                cookies = response.cookies.get_dict()
-                if '__shopping-location' in cookies:
-                    log(f"Got cookie for {location_name} ({location_id})")
-                    return cookies['__shopping-location']
-            except requests.RequestException as e:
-                log(f"Attempt {attempt+1} failed for {location_name}: {e}", "WARNING")
-                time.sleep(random.uniform(*CONFIG["request_delay"]))
-    
-    log(f"Failed to get cookie for {location_name}", "ERROR")
+                if not r.ok:
+                    log(f"{location_name}: location POST failed (status={r.status_code})", "WARNING")
+                cookie_val = session.cookies.get(SHOPPING_LOCATION_COOKIE_NAME)
+                if cookie_val:
+                    log(f"{location_name}: got location cookie", "SUCCESS")
+                    return cookie_val
+            except Exception as e:
+                log(f"{location_name}: cookie error attempt {attempt}: {e}", "WARNING")
+
+            time.sleep(random.uniform(*CONFIG["request_delay"]))
+
+    log(f"{location_name}: failed to get location cookie", "ERROR")
     return None
 
 
-async def parse_items(html_content: str, location_name: str, location_id: int) -> List[Dict]:
-    """Parse auction items from HTML using selectors."""
-    items = []
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Common selectors - inspect page to refine
-    item_elements = soup.select('.product-item, .auction-item, [data-testid="product"], .search-result-item')
-    
-    for elem in item_elements[:CONFIG["batch_size"]]:
+# ---------------------------
+# HTML parsing
+# ---------------------------
+
+_price_re = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)")
+
+
+def _parse_money(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = _price_re.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def parse_items_from_html(html: str, location_name: str, location_id: int) -> List[AuctionItem]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    candidates = (
+        soup.select("[data-testid='product']")
+        or soup.select(".product-item")
+        or soup.select(".search-result-item")
+        or soup.select(".auction-item")
+        or soup.select(".product-card")
+    )
+
+    items: List[AuctionItem] = []
+
+    for card in candidates:
         try:
-            title_elem = elem.select_one('.product-title, h3, .item-name, [class*="title"]')
-            price_elem = elem.select_one('.current-bid, .price, [class*="price"]')
-            retail_elem = elem.select_one('.retail-price, .msrp, [class*="retail"]')
-            link_elem = elem.select_one('a')
-            img_elem = elem.select_one('img')
-            
-            item = {
-                'location_id': location_id,
-                'location_name': location_name,
-                'item_id': elem.get('data-item-id') or elem.get('id') or elem.get('data-id') or '',
-                'title': title_elem.get_text(strip=True) if title_elem else '',
-                'retail_price': 0.0,
-                'current_price': 0.0,
-                'url': urljoin('https://www.nellisauction.com', link_elem.get('href')) if link_elem else '',
-                'image_url': img_elem.get('src') or img_elem.get('data-src') or '' if img_elem else ''
-            }
-            
-            # Regex for prices
-            if retail_elem:
-                retail_match = re.search(r'[\d,]+\.?\d*', retail_elem.get_text())
-                if retail_match:
-                    item['retail_price'] = float(retail_match.group().replace(',', ''))
-            
-            if price_elem:
-                price_match = re.search(r'[\d,]+\.?\d*', price_elem.get_text())
-                if price_match:
-                    item['current_price'] = float(price_match.group().replace(',', ''))
-            
-            if item['title'] and (item['item_id'] or item['url']):
-                items.append(item)
-                
-        except Exception as e:
-            log(f"Parse error for item in {location_name}: {e}", "WARNING")
+            # URL
+            a = card.select_one("a[href]")
+            href = a.get("href") if a else None
+            url = urljoin("https://www.nellisauction.com", href) if href else ""
+
+            # Item id
+            item_id = (
+                card.get("data-id")
+                or card.get("data-item-id")
+                or card.get("id")
+                or ""
+            )
+            if not item_id and url:
+                m = re.search(r"/(\d+)(?:\D|$)", url)
+                if m:
+                    item_id = m.group(1)
+
+            if not item_id:
+                continue
+
+            # Title
+            title_el = (
+                card.select_one("h3")
+                or card.select_one("[class*='title']")
+                or card.select_one("[class*='name']")
+            )
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title:
+                title = " ".join(list(card.stripped_strings)[:12])[:200]
+            if not title:
+                continue
+
+            text_blob = " ".join(card.stripped_strings).lower()
+            retail_price = None
+            current_price = None
+
+            for line in (s.strip() for s in text_blob.split("\n")):
+                low = line.lower()
+                if retail_price is None and ("retail" in low or "msrp" in low):
+                    retail_price = _parse_money(line)
+                if current_price is None and ("current" in low or "bid" in low or "now" in low):
+                    current_price = _parse_money(line)
+
+            img = card.select_one("img")
+            image_url = None
+            if img:
+                image_url = img.get("src") or img.get("data-src")
+
+            items.append(
+                AuctionItem(
+                    location_id=location_id,
+                    location_name=location_name,
+                    item_id=str(item_id),
+                    title=title,
+                    retail_price=retail_price,
+                    current_price=current_price,
+                    url=url,
+                    image_url=image_url,
+                )
+            )
+        except Exception:
             continue
-    
+
     return items
 
 
-async def crawl_location_pages(crawler: AsyncWebCrawler, location_name: str, location_id: int, cookie: str, max_items: int):
-    """Crawl pages for one location until max_items reached."""
-    all_items = []
-    page = 1
-    items_count = 0
-    
-    browser_config = BrowserConfig(headless=True)
-    cookies_dict = {'__shopping-location': cookie}
-    
-    while items_count < max_items:
-        run_config = CrawlerRunConfig(
-            browser_config=browser_config,
-            cookies=cookies_dict,
+# ---------------------------
+# Crawl loop
+# ---------------------------
+
+async def scrape_location(
+    crawler: AsyncWebCrawler,
+    db: DatabaseManager,
+    location_name: str,
+    location_id: int,
+    cookie_val: str,
+) -> None:
+    browser_cfg = BrowserConfig(headless=True, java_script_enabled=True)
+
+    total = 0
+    for page in range(1, CONFIG["max_pages_per_location"] + 1):
+        run_cfg = CrawlerRunConfig(
+            browser_config=browser_cfg,
+            cookies={SHOPPING_LOCATION_COOKIE_NAME: cookie_val},
             wait_for="body",
-            timeout=CONFIG["timeout"]
+            timeout=CONFIG["timeout"],
         )
-        
+
+        url = BASE_SEARCH_URL.format(page=page)
+        log(f"{location_name}: crawling page {page} -> {url}")
+
         try:
-            result = await crawler.arun(BASE_SEARCH_URL.format(page=page), run_config)
-            if not result.success or not result.html:
-                log(f"Crawl failed for {location_name} page {page}")
-                break
-            
-            page_items = await parse_items(result.html, location_name, location_id)
-            if not page_items:
-                log(f"No items found on {location_name} page {page} - stopping")
-                break
-            
-            all_items.extend(page_items)
-            items_count += len(page_items)
-            
-            db.insert_items_batch(page_items)
-            
-            log(f"{location_name} page {page}: {len(page_items)} items (total: {items_count})")
-            
-            if len(page_items) < CONFIG["batch_size"]:
-                break
-                
+            result = await crawler.arun(url=url, config=run_cfg)
         except Exception as e:
-            log(f"Crawl error {location_name} page {page}: {e}", "ERROR")
+            log(f"{location_name}: crawl error page {page}: {e}", "ERROR")
             break
-        
-        page += 1
-        time.sleep(random.uniform(*CONFIG["page_delay"]))
-    
-    return all_items
+
+        if not getattr(result, "success", False) or not getattr(result, "html", ""):
+            log(f"{location_name}: empty/failed result on page {page}", "WARNING")
+            break
+
+        items = parse_items_from_html(result.html, location_name, location_id)
+        if len(items) < CONFIG["min_items_per_page_stop"]:
+            log(f"{location_name}: too few items ({len(items)}). stopping.", "INFO")
+            break
+
+        db.upsert_items(items)
+        total += len(items)
+        log(f"{location_name}: page {page} stored {len(items)} (total {total})", "SUCCESS")
+
+        if total >= CONFIG["max_items_per_location"]:
+            log(f"{location_name}: reached max_items_per_location={CONFIG['max_items_per_location']}", "INFO")
+            break
+
+        await asyncio.sleep(random.uniform(*CONFIG["page_delay"]))
+
+    log(f"{location_name}: done (total stored: {total})", "SUCCESS")
 
 
-async def main():
-    refresh_db()
-    
-    crawler = AsyncWebCrawler()
-    
-    for loc_name, loc_id in LOCATION_MAP.items():
-        log(f"Starting {loc_name} (ID: {loc_id})")
-        
-        cookie = fetch_location_cookie(loc_id, loc_name)
-        if not cookie:
-            log(f"Skipping {loc_name} - no cookie", "WARNING")
-            continue
-        
-        await crawl_location_pages(crawler, loc_name, loc_id, cookie, CONFIG["max_items_per_location"])
-        
-        time.sleep(random.uniform(10, 20))
-    
-    log("Scraping complete!")
-    crawler.close()
+async def main() -> None:
+    log("Starting scraper", "INFO")
+    db = DatabaseManager()
+
+    async with AsyncWebCrawler() as crawler:
+        for location_name, location_id in LOCATION_MAP.items():
+            log(f"Preparing location {location_name} (id={location_id})", "INFO")
+
+            cookie_val = fetch_location_cookie(location_id, location_name)
+            if not cookie_val:
+                continue
+
+            await scrape_location(crawler, db, location_name, location_id, cookie_val)
+            await asyncio.sleep(random.uniform(10, 20))
+
+    db.close()
+    log("Scraper finished", "SUCCESS")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("Stopped by user")
-    except Exception as e:
-        log(f"Fatal error: {e}", "ERROR")
+    asyncio.run(main())
