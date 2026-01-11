@@ -1,0 +1,40 @@
+services:
+  # Existing Flask Web App
+  - type: web
+    name: nellis-app
+    env: python
+    buildCommand: cd app && pip install -r requirements.txt
+    startCommand: cd app && gunicorn app:app
+    envVars:
+      - key: DB_HOST
+        fromDatabase:
+          name: nellis-db
+          property: host
+      - key: DB_PASSWORD  
+        fromDatabase:
+          name: nellis-db
+          property: password
+      - key: DB_NAME
+        value: Nellis
+      - key: DB_USER
+        value: postgres
+
+  # NEW: Scraper Worker  
+  - type: worker
+    name: nellis-scraper
+    env: python
+    buildCommand: cd scraper && pip install -r requirements.txt
+    startCommand: cd scraper && python scraper.py
+    envVars:
+      - key: DB_HOST
+        fromDatabase:
+          name: nellis-db
+          property: host
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: nellis-db
+          property: password  
+      - key: DB_NAME
+        value: Nellis
+      - key: DB_USER
+        value: postgres
