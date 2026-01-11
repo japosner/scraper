@@ -116,13 +116,17 @@ class DatabaseManager:
             pass
 
     def _init_schema(self) -> None:
-        """
-        Drop and recreate auction_items to guarantee correct schema.
-        WARNING: This will delete any existing data in auction_items.
-        """
-        ddl = """
-        DROP TABLE IF EXISTS auction_items;
-
+    """
+    Drop and recreate auction_items to guarantee correct schema.
+    WARNING: This will delete any existing data in auction_items.
+    """
+    with self.conn.cursor() as cur:
+        # Drop first
+        cur.execute("DROP TABLE IF EXISTS auction_items;")
+        self.conn.commit()
+        
+        # Create table
+        create_table = """
         CREATE TABLE auction_items (
             id BIGSERIAL PRIMARY KEY,
             location_id INTEGER NOT NULL,
@@ -136,14 +140,19 @@ class DatabaseManager:
             scraped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(location_id, item_id)
         );
-
-        CREATE INDEX IF NOT EXISTS idx_auction_items_location_scraped
+        """
+        cur.execute(create_table)
+        self.conn.commit()
+        
+        # Create index
+        index_sql = """
+        CREATE INDEX idx_auction_items_location_scraped
             ON auction_items (location_id, scraped_at DESC);
         """
-        with self.conn.cursor() as cur:
-            cur.execute(ddl)
+        cur.execute(index_sql)
         self.conn.commit()
-        log("DB schema dropped & recreated (auction_items)", "SUCCESS")
+    
+    log("DB schema dropped & recreated (auction_items)", "SUCCESS")
 
     def upsert_items(self, items: List[AuctionItem]) -> None:
         if not items:
